@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { createServer, IncomingMessage, ServerResponse } from "http";
-import { dirname } from "path";
+import { basename, dirname, extname } from "path";
 import { CPU, CpuStateSnapshot } from "./hardware/cpu";
 import { JoypadButton, Memory, MemoryStateSnapshot } from "./hardware/memory";
 import {
@@ -13,7 +13,8 @@ import {
 import { RomLoader } from "./hardware/romloader";
 
 const GAMEBOY_MEMORY_SIZE = 0x10000;
-const DEFAULT_ROM_PATH = "./roms/tetris.gb";
+const DEFAULT_ROM_PATH = "./roms/pkmncrstl.gbc";
+const HARDWARE_MODEL = "cgb" as const;
 const GAMEBOY_CPU_HZ = 4_194_304;
 const GAMEBOY_FRAME_CYCLES = 70_224;
 const GAMEBOY_FRAME_RATE = GAMEBOY_CPU_HZ / GAMEBOY_FRAME_CYCLES;
@@ -21,8 +22,7 @@ const MAX_CATCH_UP_MS = 100;
 const MAX_CYCLES_PER_PUMP = GAMEBOY_FRAME_CYCLES * 2;
 const SERVER_PORT = Number(process.env.PORT ?? 3030);
 const TRACE_SIZE = 64;
-const LOAD_FROM_SNAPSHOT = true;
-const SNAPSHOT_PATH = "./state/unknown-opcode-snapshot.json";
+const LOAD_FROM_SNAPSHOT = false;
 
 type EmulatorState = {
     running: boolean;
@@ -54,6 +54,77 @@ type EmulatorSnapshot = {
     };
 };
 
+type SaveStateInfo = {
+    exists: boolean;
+    path: string;
+    updatedAt: string | null;
+};
+
+type DashboardStatePayload = {
+    romPath: string;
+    running: boolean;
+    error: string | null;
+    instructions: number;
+    frames: number;
+    cycles: number;
+    screenMode: "lcd" | "debug";
+    cartridge: {
+        title: string;
+        typeCode: string;
+        typeName: string;
+        mapper: string;
+        romBanks: number;
+        ramBanks: number;
+        features: string[];
+    };
+    registers: {
+        a: string;
+        b: string;
+        c: string;
+        d: string;
+        e: string;
+        f: string;
+        h: string;
+        l: string;
+        af: string;
+        bc: string;
+        de: string;
+        hl: string;
+        pc: string;
+        sp: string;
+    };
+    lcd: {
+        joyp: string;
+        lcdc: string;
+        ly: string;
+        scx: string;
+        scy: string;
+        bgp: string;
+    };
+    video: {
+        vramNonZeroBytes: number;
+        notes: string[];
+    };
+    audio: {
+        masterEnabled: boolean;
+        leftVolume: number;
+        rightVolume: number;
+        channels: Array<{
+            id: 1 | 2 | 3 | 4;
+            kind: "square" | "wave" | "noise";
+            enabled: boolean;
+            frequency: number;
+            volume: number;
+            duty: number;
+            panLeft: boolean;
+            panRight: boolean;
+            waveSamples: number[];
+        }>;
+    };
+    saveState: SaveStateInfo;
+    trace: string[];
+};
+
 const JOYPAD_KEYS: Record<string, JoypadButton> = {
     d: "right",
     a: "left",
@@ -78,13 +149,20 @@ const JOYPAD_BUTTONS = new Set<JoypadButton>([
 const romPath = process.argv[2] ?? DEFAULT_ROM_PATH;
 const romLoader = new RomLoader();
 const romData = romLoader.loadRom(romPath);
+const romSaveName = basename(romPath, extname(romPath)).replace(/[^a-zA-Z0-9_-]/g, "_");
+const SNAPSHOT_PATH = `./state/${romSaveName}-unknown-opcode-snapshot.json`;
+const SAVE_STATE_PATH = `./state/${romSaveName}-savestate.json`;
 const memory = new Memory(GAMEBOY_MEMORY_SIZE);
 
 memory.loadCartridge(romData);
 
 const cpu = new CPU(memory);
-memory.initializeDmgPostBootState();
-cpu.initializeDmgPostBootState();
+memory.initializePostBootState(HARDWARE_MODEL);
+if (HARDWARE_MODEL === "cgb") {
+    cpu.initializeCgbPostBootState();
+} else {
+    cpu.initializeDmgPostBootState();
+}
 const video = new VideoRenderer(memory);
 const state: EmulatorState = {
     running: true,
@@ -97,10 +175,13 @@ const state: EmulatorState = {
 
 let screenFrame = video.renderScreen();
 let tileFrame = video.renderTileAtlas({ applyPalette: false });
+let screenFrameBase64 = Buffer.from(screenFrame).toString("base64");
+let tileFrameBase64 = Buffer.from(tileFrame).toString("base64");
 const recentTrace: TraceEntry[] = [];
 let pendingCycles = 0;
 let frameCycleBudget = 0;
 let lastPumpTimestamp = performance.now();
+const streamClients = new Set<ServerResponse>();
 
 function toHex(value: number, width = 2): string {
     return `0x${value.toString(16).toUpperCase().padStart(width, "0")}`;
@@ -276,15 +357,17 @@ function getInstructionCycles(opcode: number, nextByte: number): number {
 function stepCpu(): number {
     const interruptCycles = cpu.serviceInterrupts();
     if (interruptCycles > 0) {
+        const effectiveCycles = memory.getEffectiveSystemCycles(interruptCycles);
         memory.tick(interruptCycles);
-        state.cycles += interruptCycles;
-        return interruptCycles;
+        state.cycles += effectiveCycles;
+        return effectiveCycles;
     }
 
     if (cpu.halted) {
+        const effectiveCycles = memory.getEffectiveSystemCycles(4);
         memory.tick(4);
-        state.cycles += 4;
-        return 4;
+        state.cycles += effectiveCycles;
+        return effectiveCycles;
     }
 
     const instructionAddress = cpu.pc;
@@ -292,6 +375,7 @@ function stepCpu(): number {
     const nextByte = memory.readByte((instructionAddress + 1) & 0xFFFF);
     const highByte = memory.readByte((instructionAddress + 2) & 0xFFFF);
     const cycles = getInstructionCycles(opcode, nextByte);
+    const effectiveCycles = memory.getEffectiveSystemCycles(cycles);
 
     recentTrace.push({
         pc: instructionAddress,
@@ -308,9 +392,9 @@ function stepCpu(): number {
     cpu.execute(opcode, nextByte, nextByte, highByte);
     memory.tick(cycles);
     state.instructions += 1;
-    state.cycles += cycles;
+    state.cycles += effectiveCycles;
 
-    return cycles;
+    return effectiveCycles;
 }
 
 function refreshFrames(): void {
@@ -329,7 +413,10 @@ function refreshFrames(): void {
     }
 
     tileFrame = video.renderTileAtlas({ applyPalette: false });
+    screenFrameBase64 = Buffer.from(screenFrame).toString("base64");
+    tileFrameBase64 = Buffer.from(tileFrame).toString("base64");
     state.frames += 1;
+    broadcastDashboardUpdate(state.frames % 8 === 0 || !state.running);
 }
 
 function pumpEmulator(): void {
@@ -358,7 +445,7 @@ function pumpEmulator(): void {
         }
     } catch (error) {
         if (shouldSaveSnapshot(error)) {
-            saveSnapshot();
+            saveSnapshot(SNAPSHOT_PATH);
         }
         state.running = false;
         state.error = error instanceof Error ? error.stack ?? error.message : String(error);
@@ -396,16 +483,109 @@ function writeNoContent(response: ServerResponse): void {
     response.end();
 }
 
-function shouldSaveSnapshot(error: unknown): boolean {
-    if (!(error instanceof Error)) {
-        return false;
-    }
+function buildDashboardStatePayload(): DashboardStatePayload {
+    const cartridgeInfo = memory.getCartridgeInfo();
+    const cartridgeFeatures = [
+        cartridgeInfo.hasBattery ? "battery" : null,
+        cartridgeInfo.hasRtc ? "rtc" : null,
+        cartridgeInfo.hasRumble ? "rumble" : null,
+        cartridgeInfo.cgbSupported ? (cartridgeInfo.cgbOnly ? "cgb-only" : "cgb") : null,
+        !cartridgeInfo.cgbSupported && memory.isDmgCompatibilityColorModeEnabled() ? "gbc-colorized" : null,
+    ].filter((feature): feature is string => feature !== null);
+    const audioState = memory.getAudioState();
 
-    return error.message.includes("Unknown opcode") || error.message.includes("Unknown CB opcode");
+    return {
+        romPath,
+        running: state.running,
+        error: state.error,
+        instructions: state.instructions,
+        frames: state.frames,
+        cycles: state.cycles,
+        screenMode: state.screenMode,
+        cartridge: {
+            title: cartridgeInfo.title,
+            typeCode: toHex(cartridgeInfo.typeCode),
+            typeName: cartridgeInfo.typeName,
+            mapper: cartridgeInfo.mapper.toUpperCase(),
+            romBanks: cartridgeInfo.romBanks,
+            ramBanks: cartridgeInfo.ramBanks,
+            features: cartridgeFeatures,
+        },
+        registers: {
+            a: toHex(cpu.a),
+            b: toHex(cpu.b),
+            c: toHex(cpu.c),
+            d: toHex(cpu.d),
+            e: toHex(cpu.e),
+            f: toHex(cpu.f),
+            h: toHex(cpu.h),
+            l: toHex(cpu.l),
+            af: toHex((cpu.a << 8) | cpu.f, 4),
+            bc: toHex((cpu.b << 8) | cpu.c, 4),
+            de: toHex((cpu.d << 8) | cpu.e, 4),
+            hl: toHex((cpu.h << 8) | cpu.l, 4),
+            pc: toHex(cpu.pc, 4),
+            sp: toHex(cpu.sp, 4),
+        },
+        lcd: {
+            joyp: toHex(memory.peekByte(0xFF00)),
+            lcdc: toHex(memory.peekByte(0xFF40)),
+            ly: toHex(memory.peekByte(0xFF44)),
+            scx: toHex(memory.peekByte(0xFF43)),
+            scy: toHex(memory.peekByte(0xFF42)),
+            bgp: toHex(memory.peekByte(0xFF47)),
+        },
+        video: {
+            vramNonZeroBytes: video.countNonZeroVramBytes(),
+            notes: [
+                state.screenMode === "debug"
+                    ? "LCD real blank; showing fallback debug view."
+                    : "Showing LCD view with current palette.",
+                memory.peekByte(0xFF40) === 0
+                    ? "LCDC is 0x00, the ROM still has the LCD disabled or has not initialized it yet."
+                    : `LCDC active: ${toHex(memory.peekByte(0xFF40))}`,
+                memory.peekByte(0xFF47) === 0
+                    ? "BGP is 0x00, so the hardware palette collapses all colors to white."
+                    : `BGP palette: ${toHex(memory.peekByte(0xFF47))}`,
+                memory.isCgbModeEnabled()
+                    ? "CGB color mode enabled: VRAM bank 1 and color palettes are active."
+                    : (memory.isDmgCompatibilityColorModeEnabled()
+                        ? `DMG game colorized with compatibility palette: ${memory.getDmgCompatibilityPaletteName()}.`
+                        : "DMG monochrome mode active."),
+                `Target speed: ${GAMEBOY_FRAME_RATE.toFixed(2)} FPS / ${GAMEBOY_CPU_HZ.toLocaleString()} Hz`,
+            ],
+        },
+        audio: audioState,
+        saveState: getSaveStateInfo(SAVE_STATE_PATH),
+        trace: recentTrace.slice(-12).map((entry) =>
+            `pc=${toHex(entry.pc, 4)} op=${toHex(entry.opcode)} next=[${toHex(entry.nextByte)}, ${toHex(entry.highByte)}] sp=${toHex(entry.sp, 4)}`,
+        ),
+    };
 }
 
-function saveSnapshot(): void {
-    const snapshot: EmulatorSnapshot = {
+function writeStreamEvent(response: ServerResponse, event: string, payload: unknown): void {
+    response.write(`event: ${event}\n`);
+    response.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function broadcastDashboardUpdate(includeTiles: boolean): void {
+    if (streamClients.size === 0) {
+        return;
+    }
+
+    const payload = {
+        state: buildDashboardStatePayload(),
+        screen: screenFrameBase64,
+        tiles: includeTiles ? tileFrameBase64 : null,
+    };
+
+    for (const client of streamClients) {
+        writeStreamEvent(client, "frame", payload);
+    }
+}
+
+function buildEmulatorSnapshot(): EmulatorSnapshot {
+    return {
         version: 1,
         romPath,
         cpu: cpu.saveState(),
@@ -421,21 +601,25 @@ function saveSnapshot(): void {
             frameCycleBudget,
         },
     };
-
-    mkdirSync(dirname(SNAPSHOT_PATH), { recursive: true });
-    writeFileSync(SNAPSHOT_PATH, JSON.stringify(snapshot));
 }
 
-function loadSnapshot(): boolean {
-    if (!LOAD_FROM_SNAPSHOT || !existsSync(SNAPSHOT_PATH)) {
-        return false;
+function getSaveStateInfo(savePath: string): SaveStateInfo {
+    if (!existsSync(savePath)) {
+        return {
+            exists: false,
+            path: savePath,
+            updatedAt: null,
+        };
     }
 
-    const snapshot = JSON.parse(readFileSync(SNAPSHOT_PATH, "utf8")) as EmulatorSnapshot;
-    if (snapshot.version !== 1 || snapshot.romPath !== romPath) {
-        return false;
-    }
+    return {
+        exists: true,
+        path: savePath,
+        updatedAt: statSync(savePath).mtime.toISOString(),
+    };
+}
 
+function applySnapshot(snapshot: EmulatorSnapshot): void {
     memory.loadState(snapshot.memory);
     cpu.loadState(snapshot.cpu);
 
@@ -451,8 +635,63 @@ function loadSnapshot(): boolean {
     pendingCycles = snapshot.emulator.pendingCycles;
     frameCycleBudget = snapshot.emulator.frameCycleBudget;
     lastPumpTimestamp = performance.now();
+    refreshFrames();
+}
 
+function shouldSaveSnapshot(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+        return false;
+    }
+
+    return error.message.includes("Unknown opcode") || error.message.includes("Unknown CB opcode");
+}
+
+function saveSnapshot(filePath: string): void {
+    mkdirSync(dirname(filePath), { recursive: true });
+    writeFileSync(filePath, JSON.stringify(buildEmulatorSnapshot()));
+}
+
+function loadSnapshot(filePath: string): boolean {
+    if (!existsSync(filePath)) {
+        return false;
+    }
+
+    const snapshot = JSON.parse(readFileSync(filePath, "utf8")) as EmulatorSnapshot;
+    if (snapshot.version !== 1 || snapshot.romPath !== romPath) {
+        return false;
+    }
+
+    applySnapshot(snapshot);
     return true;
+}
+
+function handleSaveStateAction(action: "save" | "load"): {
+    ok: boolean;
+    message: string;
+    saveState: SaveStateInfo;
+} {
+    if (action === "save") {
+        saveSnapshot(SAVE_STATE_PATH);
+        return {
+            ok: true,
+            message: `Savestate guardado en ${SAVE_STATE_PATH}.`,
+            saveState: getSaveStateInfo(SAVE_STATE_PATH),
+        };
+    }
+
+    if (!loadSnapshot(SAVE_STATE_PATH)) {
+        return {
+            ok: false,
+            message: "No hay savestate valido para esta ROM.",
+            saveState: getSaveStateInfo(SAVE_STATE_PATH),
+        };
+    }
+
+    return {
+        ok: true,
+        message: `Savestate cargado desde ${SAVE_STATE_PATH}.`,
+        saveState: getSaveStateInfo(SAVE_STATE_PATH),
+    };
 }
 
 function buildDashboardHtml(): string {
@@ -645,6 +884,8 @@ function buildDashboardHtml(): string {
                 <div class="stats">
                     <div class="stat"><strong>ROM</strong><span id="rom-path"></span></div>
                     <div class="stat"><strong>Status</strong><span id="status"></span></div>
+                    <div class="stat"><strong>Cart</strong><span id="cart-mapper"></span></div>
+                    <div class="stat"><strong>Cart type</strong><span id="cart-type"></span></div>
                     <div class="stat"><strong>Frames</strong><span id="frames"></span></div>
                     <div class="stat"><strong>Cycles</strong><span id="cycles"></span></div>
                     <div class="stat"><strong>Instructions</strong><span id="instructions"></span></div>
@@ -663,23 +904,50 @@ function buildDashboardHtml(): string {
                 <h2 style="margin-top: 18px;">Video notes</h2>
                 <pre id="video-notes"></pre>
 
+                <h2 style="margin-top: 18px;">Audio</h2>
+                <pre id="audio-status">Audio idle.</pre>
+                <div class="controls-grid" style="margin-top: 12px;">
+                    <button class="control-button" id="audio-enable-button">Enable audio</button>
+                    <button class="control-button" id="audio-mute-button">Mute</button>
+                    <div class="stat" style="grid-column: span 2;">
+                        <strong>Channels</strong>
+                        <span id="audio-channels">No audio data yet.</span>
+                    </div>
+                </div>
+
                 <h2 style="margin-top: 18px;">Controls</h2>
-                <pre>WASD = D-pad
+                <pre>W = Up
+A = Left
+S = Down
+D = Right
 Z = A
 X = B
 Enter = Start
 Shift = Select</pre>
                 <div class="controls-grid" style="margin-top: 12px;">
-                    <button class="control-button" data-button="up">Up</button>
-                    <button class="control-button" data-button="left">Left</button>
-                    <button class="control-button" data-button="down">Down</button>
-                    <button class="control-button" data-button="right">Right</button>
+                    <button class="control-button" data-button="up">W</button>
+                    <button class="control-button" data-button="left">A</button>
+                    <button class="control-button" data-button="down">S</button>
+                    <button class="control-button" data-button="right">D</button>
                     <button class="control-button" data-button="a">A</button>
                     <button class="control-button" data-button="b">B</button>
                     <button class="control-button" data-button="select">Select</button>
                     <button class="control-button" data-button="start">Start</button>
                 </div>
                 <pre id="input-status" style="margin-top: 12px;">Input idle.</pre>
+
+                <h2 style="margin-top: 18px;">Save State</h2>
+                <pre>K = Save state
+L = Load state</pre>
+                <div class="controls-grid" style="margin-top: 12px;">
+                    <button class="control-button" id="save-state-button">Save (K)</button>
+                    <button class="control-button" id="load-state-button">Load (L)</button>
+                    <div class="stat" style="grid-column: span 2;">
+                        <strong>Last save</strong>
+                        <span id="save-state-updated">No save yet.</span>
+                    </div>
+                </div>
+                <pre id="save-state-status" style="margin-top: 12px;">Savestate idle.</pre>
 
                 <h2 style="margin-top: 18px;">Last error</h2>
                 <pre id="error">No errors.</pre>
@@ -700,6 +968,13 @@ Shift = Select</pre>
         const screenContext = screenCanvas.getContext("2d");
         const tilesContext = tilesCanvas.getContext("2d");
         const inputStatus = document.getElementById("input-status");
+        const saveStateStatus = document.getElementById("save-state-status");
+        const saveStateButton = document.getElementById("save-state-button");
+        const loadStateButton = document.getElementById("load-state-button");
+        const audioStatus = document.getElementById("audio-status");
+        const audioChannels = document.getElementById("audio-channels");
+        const audioEnableButton = document.getElementById("audio-enable-button");
+        const audioMuteButton = document.getElementById("audio-mute-button");
         const controlButtons = Array.from(document.querySelectorAll("[data-button]"));
         const pressedKeys = new Set();
         const keyToButton = {
@@ -714,19 +989,8 @@ Shift = Select</pre>
         };
 
         function drawFrame(context, width, height, bytes) {
-            const imageData = context.createImageData(width, height);
-
-            for (let index = 0; index < bytes.length; index += 1) {
-                const shade = bytes[index] ?? 0;
-                const [r, g, b] = palette[shade] ?? palette[0];
-                const offset = index * 4;
-
-                imageData.data[offset] = r;
-                imageData.data[offset + 1] = g;
-                imageData.data[offset + 2] = b;
-                imageData.data[offset + 3] = 255;
-            }
-
+            const rgba = new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            const imageData = new ImageData(rgba, width, height);
             context.putImageData(imageData, 0, 0);
         }
 
@@ -738,13 +1002,241 @@ Shift = Select</pre>
             inputStatus.textContent = message;
         }
 
-        async function fetchBinary(url) {
-            const response = await fetch(url, { cache: "no-store" });
-            return new Uint8Array(await response.arrayBuffer());
+        function setSaveStateStatus(message) {
+            saveStateStatus.textContent = message;
+        }
+
+        function setAudioStatus(message) {
+            audioStatus.textContent = message;
         }
 
         function normalizeKey(event) {
             return event.key.length === 1 ? event.key.toLowerCase() : event.key;
+        }
+
+        function decodeBase64Frame(base64) {
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+
+            for (let index = 0; index < binary.length; index += 1) {
+                bytes[index] = binary.charCodeAt(index);
+            }
+
+            return bytes;
+        }
+
+        function createDutyWave(context, duty) {
+            const dutyCycles = [0.125, 0.25, 0.5, 0.75];
+            const harmonicCount = 32;
+            const real = new Float32Array(harmonicCount);
+            const imag = new Float32Array(harmonicCount);
+            const dutyCycle = dutyCycles[duty] ?? 0.5;
+
+            for (let harmonic = 1; harmonic < harmonicCount; harmonic += 1) {
+                imag[harmonic] = (2 / (harmonic * Math.PI)) * Math.sin(Math.PI * harmonic * dutyCycle);
+            }
+
+            return context.createPeriodicWave(real, imag);
+        }
+
+        function createWavePeriodicWave(context, samples) {
+            const length = samples.length || 32;
+            const real = new Float32Array(length);
+            const imag = new Float32Array(length);
+
+            for (let harmonic = 1; harmonic < length; harmonic += 1) {
+                let realSum = 0;
+                let imagSum = 0;
+
+                for (let index = 0; index < length; index += 1) {
+                    const sample = ((samples[index] ?? 0) * 2) - 1;
+                    const phase = (2 * Math.PI * harmonic * index) / length;
+
+                    realSum += sample * Math.cos(phase);
+                    imagSum += sample * Math.sin(phase);
+                }
+
+                real[harmonic] = realSum / length;
+                imag[harmonic] = imagSum / length;
+            }
+
+            return context.createPeriodicWave(real, imag);
+        }
+
+        function createNoiseBuffer(context) {
+            const frameCount = context.sampleRate;
+            const audioBuffer = context.createBuffer(1, frameCount, context.sampleRate);
+            const channelData = audioBuffer.getChannelData(0);
+
+            for (let index = 0; index < frameCount; index += 1) {
+                channelData[index] = (Math.random() * 2) - 1;
+            }
+
+            return audioBuffer;
+        }
+
+        const audioEngine = {
+            context: null,
+            masterGain: null,
+            userGain: 0.18,
+            muted: false,
+            initialized: false,
+            noiseBuffer: null,
+            squareDutyWaves: [],
+            channels: [],
+        };
+
+        function updateAudioOutputLevel() {
+            if (!audioEngine.masterGain) {
+                return;
+            }
+
+            audioEngine.masterGain.gain.value = audioEngine.muted ? 0 : audioEngine.userGain;
+        }
+
+        function createOscillatorChannel(kind) {
+            const context = audioEngine.context;
+            const oscillator = context.createOscillator();
+            const gain = context.createGain();
+            const panner = context.createStereoPanner();
+
+            gain.gain.value = 0;
+            panner.pan.value = 0;
+            oscillator.type = kind === "wave" ? "sine" : "square";
+            oscillator.connect(gain);
+            gain.connect(panner);
+            panner.connect(audioEngine.masterGain);
+            oscillator.start();
+
+            return { kind, oscillator, gain, panner, lastDuty: 2 };
+        }
+
+        function createNoiseChannel() {
+            const context = audioEngine.context;
+            const source = context.createBufferSource();
+            const gain = context.createGain();
+            const panner = context.createStereoPanner();
+            const filter = context.createBiquadFilter();
+
+            source.buffer = audioEngine.noiseBuffer;
+            source.loop = true;
+            filter.type = "highpass";
+            filter.frequency.value = 1000;
+            gain.gain.value = 0;
+            source.connect(filter);
+            filter.connect(gain);
+            gain.connect(panner);
+            panner.connect(audioEngine.masterGain);
+            source.start();
+
+            return { kind: "noise", source, gain, panner, filter };
+        }
+
+        async function ensureAudioEngine() {
+            if (audioEngine.initialized) {
+                if (audioEngine.context.state === "suspended") {
+                    await audioEngine.context.resume();
+                }
+                setAudioStatus("Audio enabled.");
+                return;
+            }
+
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextClass) {
+                setAudioStatus("Web Audio is not available in this browser.");
+                return;
+            }
+
+            const context = new AudioContextClass();
+            const masterGain = context.createGain();
+
+            masterGain.connect(context.destination);
+            audioEngine.context = context;
+            audioEngine.masterGain = masterGain;
+            audioEngine.noiseBuffer = createNoiseBuffer(context);
+            audioEngine.squareDutyWaves = [
+                createDutyWave(context, 0),
+                createDutyWave(context, 1),
+                createDutyWave(context, 2),
+                createDutyWave(context, 3),
+            ];
+            audioEngine.channels = [
+                createOscillatorChannel("square"),
+                createOscillatorChannel("square"),
+                createOscillatorChannel("wave"),
+                createNoiseChannel(),
+            ];
+            audioEngine.initialized = true;
+            updateAudioOutputLevel();
+            await context.resume();
+            setAudioStatus("Audio enabled.");
+        }
+
+        function applyChannelPan(channelNode, channelState) {
+            if (channelState.panLeft && channelState.panRight) {
+                channelNode.panner.pan.value = 0;
+            } else if (channelState.panLeft) {
+                channelNode.panner.pan.value = -1;
+            } else if (channelState.panRight) {
+                channelNode.panner.pan.value = 1;
+            } else {
+                channelNode.panner.pan.value = 0;
+            }
+        }
+
+        function applyAudioState(audioState) {
+            audioChannels.textContent = audioState.channels
+                .map((channel) =>
+                    "CH" +
+                    channel.id +
+                    ":" +
+                    (channel.enabled ? "on" : "off") +
+                    " " +
+                    channel.kind +
+                    " " +
+                    channel.frequency.toFixed(1) +
+                    "Hz",
+                )
+                .join(" | ");
+
+            if (!audioEngine.initialized) {
+                setAudioStatus(
+                    audioState.masterEnabled
+                        ? "Audio registers active. Click Enable audio to listen."
+                        : "Audio master disabled in the emulated hardware.",
+                );
+                return;
+            }
+
+            const stereoMaster = Math.max(audioState.leftVolume, audioState.rightVolume);
+            audioEngine.masterGain.gain.value = audioEngine.muted ? 0 : audioEngine.userGain * stereoMaster;
+
+            for (let index = 0; index < audioState.channels.length; index += 1) {
+                const channelState = audioState.channels[index];
+                const node = audioEngine.channels[index];
+                const audible = channelState.enabled && (channelState.panLeft || channelState.panRight) && channelState.volume > 0;
+
+                if (node.kind === "noise") {
+                    node.gain.gain.value = audible ? channelState.volume * 0.18 : 0;
+                    node.source.playbackRate.value = Math.max(0.05, Math.min(4, channelState.frequency / 2048));
+                    node.filter.frequency.value = Math.max(80, Math.min(12000, channelState.frequency * 3));
+                    applyChannelPan(node, channelState);
+                    continue;
+                }
+
+                if (channelState.kind === "wave") {
+                    node.oscillator.setPeriodicWave(createWavePeriodicWave(audioEngine.context, channelState.waveSamples));
+                } else if (node.lastDuty !== channelState.duty) {
+                    node.oscillator.setPeriodicWave(audioEngine.squareDutyWaves[channelState.duty] ?? audioEngine.squareDutyWaves[2]);
+                    node.lastDuty = channelState.duty;
+                }
+
+                node.oscillator.frequency.value = Math.max(0.001, channelState.frequency);
+                node.gain.gain.value = audible ? channelState.volume * 0.16 : 0;
+                applyChannelPan(node, channelState);
+            }
+
+            setAudioStatus(audioState.masterEnabled ? "Audio streaming from Web Audio." : "Audio master disabled in the emulated hardware.");
         }
 
         function setButtonPressed(button, pressed) {
@@ -771,9 +1263,49 @@ Shift = Select</pre>
                 });
         }
 
+        async function sendSaveStateAction(action, source) {
+            const label = action === "save" ? "save" : "load";
+            setSaveStateStatus("Attempting to " + label + " via " + source + "...");
+
+            try {
+                const response = await fetch("/savestate?action=" + encodeURIComponent(action), {
+                    cache: "no-store",
+                });
+                const payload = await response.json();
+
+                setSaveStateStatus(payload.message);
+                setText(
+                    "save-state-updated",
+                    payload.saveState.exists && payload.saveState.updatedAt
+                        ? payload.saveState.updatedAt
+                        : "No save yet.",
+                );
+            } catch (error) {
+                setSaveStateStatus("Savestate error: " + String(error));
+            }
+        }
+
         function handleKeyDown(event) {
             const key = normalizeKey(event);
             const button = keyToButton[key];
+
+            if (key === "k") {
+                if (event.repeat) {
+                    return;
+                }
+                event.preventDefault();
+                sendSaveStateAction("save", "keyboard");
+                return;
+            }
+
+            if (key === "l") {
+                if (event.repeat) {
+                    return;
+                }
+                event.preventDefault();
+                sendSaveStateAction("load", "keyboard");
+                return;
+            }
 
             if (!button || pressedKeys.has(key)) {
                 return;
@@ -837,68 +1369,123 @@ Shift = Select</pre>
             });
         }
 
+        saveStateButton.addEventListener("click", () => {
+            sendSaveStateAction("save", "button");
+        });
+
+        loadStateButton.addEventListener("click", () => {
+            sendSaveStateAction("load", "button");
+        });
+
+        audioEnableButton.addEventListener("click", async () => {
+            try {
+                await ensureAudioEngine();
+            } catch (error) {
+                setAudioStatus("Audio init error: " + String(error));
+            }
+        });
+
+        audioMuteButton.addEventListener("click", () => {
+            audioEngine.muted = !audioEngine.muted;
+            updateAudioOutputLevel();
+            audioMuteButton.textContent = audioEngine.muted ? "Unmute" : "Mute";
+            setAudioStatus(audioEngine.muted ? "Audio muted." : "Audio unmuted.");
+        });
+
         window.addEventListener("load", () => {
             window.focus();
             document.body.focus();
             setInputStatus("Input ready. Click the page or use the on-screen buttons if keyboard focus is stubborn.");
+            setSaveStateStatus("Savestate ready.");
+            setAudioStatus("Audio ready. Click Enable audio to start Web Audio.");
         });
 
-        async function tick() {
-            try {
-                const [screen, tiles, emulatorState] = await Promise.all([
-                    fetchBinary("/frame/screen"),
-                    fetchBinary("/frame/tiles"),
-                    fetch("/state", { cache: "no-store" }).then((response) => response.json()),
-                ]);
-
-                drawFrame(screenContext, ${LCD_WIDTH}, ${LCD_HEIGHT}, screen);
-                drawFrame(tilesContext, ${TILESET_WIDTH}, ${TILESET_HEIGHT}, tiles);
-
-                setText("rom-path", emulatorState.romPath);
-                setText("status", emulatorState.running ? "running" : "stopped");
-                document.getElementById("status").className = emulatorState.running ? "status-running" : "status-stopped";
-                setText("frames", String(emulatorState.frames));
-                setText("cycles", String(emulatorState.cycles));
-                setText("instructions", String(emulatorState.instructions));
-                setText("pc", emulatorState.registers.pc);
-                setText("sp", emulatorState.registers.sp);
-                setText("joyp", emulatorState.lcd.joyp);
-                setText("lcdc", emulatorState.lcd.lcdc);
-                setText("ly", emulatorState.lcd.ly);
-                setText("screen-mode", emulatorState.screenMode);
-                setText("vram-non-zero", String(emulatorState.video.vramNonZeroBytes));
-                setText(
-                    "registers",
-                    [
-                        "AF: " + emulatorState.registers.af,
-                        "BC: " + emulatorState.registers.bc,
-                        "DE: " + emulatorState.registers.de,
-                        "HL: " + emulatorState.registers.hl,
-                        "A:  " + emulatorState.registers.a,
-                        "B:  " + emulatorState.registers.b,
-                        "C:  " + emulatorState.registers.c,
-                        "D:  " + emulatorState.registers.d,
-                        "E:  " + emulatorState.registers.e,
-                        "H:  " + emulatorState.registers.h,
-                        "L:  " + emulatorState.registers.l,
-                        "F:  " + emulatorState.registers.f,
-                    ].join("\\n"),
-                );
-                setText("video-notes", emulatorState.video.notes.join("\\n"));
-                setText(
-                    "error",
-                    emulatorState.error
-                        ? emulatorState.error + "\\n\\nRecent trace:\\n" + emulatorState.trace.join("\\n")
-                        : "No errors.",
-                );
-            } catch (error) {
-                setText("error", String(error));
-            } finally {
-                window.setTimeout(tick, 120);
-            }
+        function applyEmulatorState(emulatorState) {
+            setText("rom-path", emulatorState.romPath);
+            setText("status", emulatorState.running ? "running" : "stopped");
+            document.getElementById("status").className = emulatorState.running ? "status-running" : "status-stopped";
+            setText(
+                "cart-mapper",
+                emulatorState.cartridge.mapper +
+                    " | " +
+                    emulatorState.cartridge.title,
+            );
+            setText(
+                "cart-type",
+                emulatorState.cartridge.typeName +
+                    " " +
+                    emulatorState.cartridge.typeCode +
+                    " | ROM " +
+                    emulatorState.cartridge.romBanks +
+                    " | RAM " +
+                    emulatorState.cartridge.ramBanks +
+                    (emulatorState.cartridge.features.length > 0
+                        ? " | " + emulatorState.cartridge.features.join(", ")
+                        : ""),
+            );
+            setText("frames", String(emulatorState.frames));
+            setText("cycles", String(emulatorState.cycles));
+            setText("instructions", String(emulatorState.instructions));
+            setText("pc", emulatorState.registers.pc);
+            setText("sp", emulatorState.registers.sp);
+            setText("joyp", emulatorState.lcd.joyp);
+            setText("lcdc", emulatorState.lcd.lcdc);
+            setText("ly", emulatorState.lcd.ly);
+            setText("screen-mode", emulatorState.screenMode);
+            setText("vram-non-zero", String(emulatorState.video.vramNonZeroBytes));
+            setText(
+                "save-state-updated",
+                emulatorState.saveState.exists && emulatorState.saveState.updatedAt
+                    ? emulatorState.saveState.updatedAt
+                    : "No save yet.",
+            );
+            setText(
+                "registers",
+                [
+                    "AF: " + emulatorState.registers.af,
+                    "BC: " + emulatorState.registers.bc,
+                    "DE: " + emulatorState.registers.de,
+                    "HL: " + emulatorState.registers.hl,
+                    "A:  " + emulatorState.registers.a,
+                    "B:  " + emulatorState.registers.b,
+                    "C:  " + emulatorState.registers.c,
+                    "D:  " + emulatorState.registers.d,
+                    "E:  " + emulatorState.registers.e,
+                    "H:  " + emulatorState.registers.h,
+                    "L:  " + emulatorState.registers.l,
+                    "F:  " + emulatorState.registers.f,
+                ].join("\\n"),
+            );
+            setText("video-notes", emulatorState.video.notes.join("\\n"));
+            applyAudioState(emulatorState.audio);
+            setText(
+                "error",
+                emulatorState.error
+                    ? emulatorState.error + "\\n\\nRecent trace:\\n" + emulatorState.trace.join("\\n")
+                    : "No errors.",
+            );
         }
 
-        tick();
+        const stream = new EventSource("/stream");
+
+        stream.addEventListener("open", () => {
+            setInputStatus("Live stream connected.");
+        });
+
+        stream.addEventListener("frame", (event) => {
+            const payload = JSON.parse(event.data);
+            drawFrame(screenContext, ${LCD_WIDTH}, ${LCD_HEIGHT}, decodeBase64Frame(payload.screen));
+
+            if (payload.tiles) {
+                drawFrame(tilesContext, ${TILESET_WIDTH}, ${TILESET_HEIGHT}, decodeBase64Frame(payload.tiles));
+            }
+
+            applyEmulatorState(payload.state);
+        });
+
+        stream.addEventListener("error", () => {
+            setText("error", "Live stream disconnected. Waiting for reconnection...");
+        });
     </script>
 </body>
 </html>`;
@@ -927,6 +1514,28 @@ function handleRequest(request: IncomingMessage, response: ServerResponse): void
         return;
     }
 
+    if (parsedUrl.pathname === "/stream") {
+        response.writeHead(200, {
+            "Cache-Control": "no-store",
+            Connection: "keep-alive",
+            "Content-Type": "text/event-stream; charset=utf-8",
+        });
+        response.write("\n");
+
+        streamClients.add(response);
+        writeStreamEvent(response, "frame", {
+            state: buildDashboardStatePayload(),
+            screen: screenFrameBase64,
+            tiles: tileFrameBase64,
+        });
+
+        request.on("close", () => {
+            streamClients.delete(response);
+            response.end();
+        });
+        return;
+    }
+
     if (parsedUrl.pathname === "/input") {
         const button = parsedUrl.searchParams.get("button");
         const pressed = parsedUrl.searchParams.get("pressed") === "1";
@@ -944,58 +1553,34 @@ function handleRequest(request: IncomingMessage, response: ServerResponse): void
         return;
     }
 
+    if (parsedUrl.pathname === "/savestate") {
+        const action = parsedUrl.searchParams.get("action");
+
+        if (action !== "save" && action !== "load") {
+            response.writeHead(400, {
+                "Content-Type": "application/json; charset=utf-8",
+            });
+            response.end(JSON.stringify({
+                ok: false,
+                message: "Invalid savestate action",
+                saveState: getSaveStateInfo(SAVE_STATE_PATH),
+            }));
+            return;
+        }
+
+        const wasRunning = state.running;
+        const result = handleSaveStateAction(action);
+
+        if (action === "load" && result.ok && !wasRunning) {
+            setImmediate(pumpEmulator);
+        }
+
+        writeJson(response, result);
+        return;
+    }
+
     if (parsedUrl.pathname === "/state") {
-        writeJson(response, {
-            romPath,
-            running: state.running,
-            error: state.error,
-            instructions: state.instructions,
-            frames: state.frames,
-            cycles: state.cycles,
-            screenMode: state.screenMode,
-            registers: {
-                a: toHex(cpu.a),
-                b: toHex(cpu.b),
-                c: toHex(cpu.c),
-                d: toHex(cpu.d),
-                e: toHex(cpu.e),
-                f: toHex(cpu.f),
-                h: toHex(cpu.h),
-                l: toHex(cpu.l),
-                af: toHex((cpu.a << 8) | cpu.f, 4),
-                bc: toHex((cpu.b << 8) | cpu.c, 4),
-                de: toHex((cpu.d << 8) | cpu.e, 4),
-                hl: toHex((cpu.h << 8) | cpu.l, 4),
-                pc: toHex(cpu.pc, 4),
-                sp: toHex(cpu.sp, 4),
-            },
-            lcd: {
-                joyp: toHex(memory.peekByte(0xFF00)),
-                lcdc: toHex(memory.peekByte(0xFF40)),
-                ly: toHex(memory.peekByte(0xFF44)),
-                scx: toHex(memory.peekByte(0xFF43)),
-                scy: toHex(memory.peekByte(0xFF42)),
-                bgp: toHex(memory.peekByte(0xFF47)),
-            },
-            video: {
-                vramNonZeroBytes: video.countNonZeroVramBytes(),
-                notes: [
-                    state.screenMode === "debug"
-                        ? "LCD real blank; showing fallback debug view."
-                        : "Showing LCD view with current palette.",
-                    memory.peekByte(0xFF40) === 0
-                        ? "LCDC is 0x00, the ROM still has the LCD disabled or has not initialized it yet."
-                        : `LCDC active: ${toHex(memory.peekByte(0xFF40))}`,
-                    memory.peekByte(0xFF47) === 0
-                        ? "BGP is 0x00, so the hardware palette collapses all colors to white."
-                        : `BGP palette: ${toHex(memory.peekByte(0xFF47))}`,
-                    `Target speed: ${GAMEBOY_FRAME_RATE.toFixed(2)} FPS / ${GAMEBOY_CPU_HZ.toLocaleString()} Hz`,
-                ],
-            },
-            trace: recentTrace.slice(-12).map((entry) =>
-                `pc=${toHex(entry.pc, 4)} op=${toHex(entry.opcode)} next=[${toHex(entry.nextByte)}, ${toHex(entry.highByte)}] sp=${toHex(entry.sp, 4)}`,
-            ),
-        });
+        writeJson(response, buildDashboardStatePayload());
         return;
     }
 
@@ -1005,13 +1590,20 @@ function handleRequest(request: IncomingMessage, response: ServerResponse): void
     response.end("Not found");
 }
 
-loadSnapshot();
+if (LOAD_FROM_SNAPSHOT) {
+    loadSnapshot(SNAPSHOT_PATH);
+}
 refreshFrames();
 
 createServer(handleRequest).listen(SERVER_PORT, () => {
     console.log(`miniGB video debug available at http://localhost:${SERVER_PORT}`);
     console.log(`ROM loaded from ${romPath} (${romData.length} bytes)`);
-    console.log(LOAD_FROM_SNAPSHOT ? `snapshot restore enabled (${SNAPSHOT_PATH})` : "snapshot restore disabled");
+    console.log(
+        LOAD_FROM_SNAPSHOT
+            ? `unknown-opcode snapshot restore enabled (${SNAPSHOT_PATH})`
+            : "unknown-opcode snapshot restore disabled",
+    );
+    console.log(`savestate path: ${SAVE_STATE_PATH}`);
 });
 
 pumpEmulator();

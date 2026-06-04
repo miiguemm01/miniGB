@@ -74,6 +74,28 @@ export class CPU {
         this.updateFRegister();
     }
 
+    initializeCgbPostBootState() {
+        this.a = 0x11;
+        this.b = 0x00;
+        this.c = 0x00;
+        this.d = 0xFF;
+        this.e = 0x56;
+        this.h = 0x00;
+        this.l = 0x0D;
+        this.pc = 0x0100;
+        this.sp = 0xFFFE;
+        this.halted = false;
+        this.ime = false;
+        this.imeScheduled = false;
+        this.flags = {
+            z: true,
+            n: false,
+            h: false,
+            c: false,
+        };
+        this.updateFRegister();
+    }
+
     saveState(): CpuStateSnapshot {
         return {
             a: this.a,
@@ -1985,6 +2007,150 @@ export class CPU {
                 this.pc = 0x0028;
                 break;
             }
+            case 0x9E: { // SBC A,(HL)
+                const carry = this.flags.c ? 1 : 0;
+                const originalA = this.a;
+                const value = this.memory.readByte(this.getHlAddress());
+
+                const result = originalA - value - carry;
+
+                this.a = result & 0xFF;
+
+                this.setFlags({
+                    z: this.a === 0,
+                    n: true,
+                    h: (originalA & 0x0F) < ((value & 0x0F) + carry),
+                    c: originalA < (value + carry),
+                });
+
+                this.advancePc(1);
+                break;
+            }
+            case 0xAA: { // XOR A,D
+                this.a ^= this.d;
+
+                this.setFlags({
+                    z: this.a === 0,
+                    n: false,
+                    h: false,
+                    c: false,
+                });
+
+                this.advancePc(1);
+                break;
+            }
+            case 0x8B: { // ADC A,E
+                const carry = this.flags.c ? 1 : 0;
+                const originalA = this.a;
+                const value = this.e;
+
+                const result = originalA + value + carry;
+
+                this.a = result & 0xFF;
+
+                this.setFlags({
+                    z: this.a === 0,
+                    n: false,
+                    h: ((originalA & 0x0F) + (value & 0x0F) + carry) > 0x0F,
+                    c: result > 0xFF,
+                });
+
+                this.advancePc(1);
+                break;
+            }
+            case 0x1F: { // RRA
+                const carryIn = this.flags.c ? 1 : 0;
+                const carryOut = (this.a & 0x01) !== 0;
+
+                this.a = ((this.a >>> 1) | (carryIn << 7)) & 0xFF;
+
+                this.setFlags({
+                    z: false,
+                    n: false,
+                    h: false,
+                    c: carryOut,
+                });
+
+                this.advancePc(1);
+                break;
+            }
+            case 0x10: { // STOP 0
+                if (nextByte !== 0x00) {
+                    console.warn(`STOP with non-zero padding: 0x${nextByte?.toString(16)}`);
+                }
+
+                this.memory.handleStopModeSwitch();
+                this.advancePc(2);
+                break;
+            }
+            case 0xCE: { // ADC A,d8
+                if (nextByte === undefined) {
+                    throw new Error("Expected next byte for ADC A,d8");
+                }
+
+                const carry = this.flags.c ? 1 : 0;
+                const originalA = this.a;
+                const value = nextByte;
+
+                const result = originalA + value + carry;
+
+                this.a = result & 0xFF;
+
+                this.setFlags({
+                    z: this.a === 0,
+                    n: false,
+                    h: ((originalA & 0x0F) + (value & 0x0F) + carry) > 0x0F,
+                    c: result > 0xFF,
+                });
+
+                this.advancePc(2);
+                break;
+            }
+            case 0xD7: { // RST 10H
+                this.sp = (this.sp - 2) & 0xFFFF;
+                this.memory.writeWord(this.sp, (this.pc + 1) & 0xFFFF);
+
+                this.pc = 0x0010;
+                break;
+            }
+            case 0x8C: { // ADC A,H
+                const carry = this.flags.c ? 1 : 0;
+                const originalA = this.a;
+                const value = this.h;
+
+                const result = originalA + value + carry;
+
+                this.a = result & 0xFF;
+
+                this.setFlags({
+                    z: this.a === 0,
+                    n: false,
+                    h: ((originalA & 0x0F) + (value & 0x0F) + carry) > 0x0F,
+                    c: result > 0xFF,
+                });
+
+                this.advancePc(1);
+                break;
+            }
+            case 0x8F: { // ADC A,A
+                const carry = this.flags.c ? 1 : 0;
+                const originalA = this.a;
+                const value = this.a;
+
+                const result = originalA + value + carry;
+
+                this.a = result & 0xFF;
+
+                this.setFlags({
+                    z: this.a === 0,
+                    n: false,
+                    h: ((originalA & 0x0F) + (value & 0x0F) + carry) > 0x0F,
+                    c: result > 0xFF,
+                });
+
+                this.advancePc(1);
+                break;
+            }
             default: // Unknown opcode
                 throw new Error(`Unknown opcode. ${this.formatCpuContext(opcode)}`);
         }
@@ -2500,6 +2666,48 @@ export class CPU {
                     n: false,
                     h: false,
                     c: carryOut,
+                });
+
+                break;
+            }
+            case 0x3B: { // SRL E
+                const carry = (this.e & 0x01) !== 0;
+
+                this.e = this.e >>> 1;
+
+                this.setFlags({
+                    z: this.e === 0,
+                    n: false,
+                    h: false,
+                    c: carry,
+                });
+
+                break;
+            }
+            case 0x3A: { // SRL D
+                const carryOut = (this.d & 0x01) !== 0;
+
+                this.d = (this.d >> 1) & 0xFF;
+
+                this.setFlags({
+                    z: this.d === 0,
+                    n: false,
+                    h: false,
+                    c: carryOut,
+                });
+
+                break;
+            }
+            case 0x01: { // RLC C
+                const carry = (this.c & 0x80) !== 0;
+
+                this.c = ((this.c << 1) | (carry ? 1 : 0)) & 0xFF;
+
+                this.setFlags({
+                    z: this.c === 0,
+                    n: false,
+                    h: false,
+                    c: carry,
                 });
 
                 break;
