@@ -120,12 +120,9 @@ Esto sirve para:
 3. Implementar el opcode
 4. Reanudar desde ese punto sin volver a recorrer toda la ROM
 
-## ROMs incluidas en el repo
+## ROMs incluidas en el repo - EDIT: Se han suprimido.
 
-- `roms/pkmnred.gb`
-- `roms/pkmnyellow.gb`
-- `roms/tetris.gb`
-- `roms/cpu_instrs.gb`
+Ninguna.
 
 ## Limitaciones conocidas
 
