@@ -2,7 +2,7 @@
 
 Emulador homemade de Nintendo Game Boy y Game Boy Color escrito en TypeScript.
 
-El proyecto esta orientado a depuracion e iteracion rapida: ejecuta ROMs, expone un panel web en tiempo real, permite guardar y cargar estado por ROM, y guarda snapshots automaticos cuando aparece un opcode no implementado.
+El proyecto sigue orientado a depuracion e iteracion rapida, pero ahora el panel corre como app de escritorio con Electron en vez de depender de un servidor web embebido.
 
 ## Estado actual
 
@@ -17,8 +17,9 @@ El proyecto esta orientado a depuracion e iteracion rapida: ejecuta ROMs, expone
   - `KEY1` y cambio de velocidad
   - base de `HDMA/GDMA`
 - Colorizacion de compatibilidad para juegos DMG ejecutados sobre hardware CGB
-- Panel web de depuracion en tiempo real con streaming
-- Input desde navegador
+- App Electron de depuracion en tiempo real
+- Input integrado en la ventana
+- Controles de velocidad `1x`, `2x`, `4x` y `8x` en tiempo real
 - Audio experimental desde Web Audio
 - Savestates por ROM
 - Snapshots automaticos al encontrar opcodes no implementados
@@ -27,8 +28,20 @@ No es un emulador completo ni exacto todavia. Varias partes del hardware siguen 
 
 ## Estructura
 
-- [src/index.ts](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/index.ts)
-  Punto de entrada, bucle principal, servidor HTTP, panel web, input, stream, savestates y snapshots.
+- [src/electron/main.ts](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/electron/main.ts)
+  Punto de entrada de Electron, ventana principal e IPC.
+
+- [src/emulator/session.ts](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/emulator/session.ts)
+  Sesion reutilizable del emulador: bucle principal, input, frames, savestates y snapshots.
+
+- [src/ui/index.html](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/ui/index.html)
+  Interfaz local cargada por Electron.
+
+- [src/electron/preload.js](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/electron/preload.js)
+  Bridge seguro entre renderer e IPC para input, frames, savestates y velocidad.
+
+- [src/emulator/types.ts](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/emulator/types.ts)
+  Tipos compartidos del estado, payloads de frame y API expuesta al renderer.
 
 - [src/hardware/cpu.ts](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/hardware/cpu.ts)
   Implementacion de opcodes, flags, interrupciones y estado de CPU.
@@ -38,9 +51,6 @@ No es un emulador completo ni exacto todavia. Varias partes del hardware siguen 
 
 - [src/hardware/video.ts](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/hardware/video.ts)
   Renderer de LCD y tileset de VRAM, tanto en escala DMG como en color CGB.
-
-- [src/hardware/romloader.ts](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/hardware/romloader.ts)
-  Carga de ROMs desde disco.
 
 ## Requisitos
 
@@ -55,7 +65,7 @@ npm install
 
 ## Uso
 
-Por defecto arranca con `./roms/pkmnyll.gb`:
+Por defecto arranca con `./roms/pkmncrstl.gbc`:
 
 ```bash
 npm start
@@ -67,21 +77,11 @@ Tambien puedes pasar otra ROM como argumento:
 npm start -- ./roms/tetris.gb
 ```
 
-Despues abre:
-
-```text
-http://localhost:3030
-```
-
-Si quieres otro puerto:
-
-```powershell
-$env:PORT=3040; npm start
-```
+Se abrira directamente la ventana de Electron con el panel de depuracion.
 
 ## Panel de depuracion
 
-El panel muestra:
+La app muestra:
 
 - LCD renderizada
 - Tileset completo de VRAM
@@ -89,13 +89,14 @@ El panel muestra:
 - `PC`, `SP`, `LCDC`, `LY`, `JOYP`
 - mapper, tipo de cartucho, bancos ROM/RAM y features detectadas
 - numero de instrucciones, ciclos y frames
+- selector de velocidad `1x`, `2x`, `4x`, `8x`
 - modo de pantalla (`lcd` o `debug`)
 - notas de video
 - estado del audio
 - ultimo error y traza reciente
 - informacion del savestate actual
 
-La UI ya no usa polling continuo para cada recurso. El panel recibe el estado y los frames mediante un stream persistente desde el servidor embebido.
+El renderer recibe estado y frames por IPC desde el proceso principal, sin `HTTP`, `SSE` ni polling del navegador.
 
 ## Controles
 
@@ -112,6 +113,8 @@ La UI ya no usa polling continuo para cada recurso. El panel recibe el estado y 
 
 Tambien hay botones on-screen para input, save/load y control de audio.
 
+La velocidad de emulacion se puede cambiar desde la UI con botones `1x`, `2x`, `4x` y `8x`.
+
 ## Savestates
 
 Cada ROM tiene su propio savestate:
@@ -120,12 +123,10 @@ Cada ROM tiene su propio savestate:
 ./state/<rom>-savestate.json
 ```
 
-Desde el panel puedes:
+Desde la app puedes:
 
-- guardar con `K` o `Save`
-- cargar con `L` o `Load`
-
-El savestate incluye CPU, memoria, bancos de ROM/RAM, estado CGB, audio, counters del emulador y traza reciente.
+- guardar con `K` o `Save State`
+- cargar con `L` o `Load State`
 
 ## Snapshots de opcode faltante
 
@@ -137,48 +138,13 @@ Ruta:
 ./state/<rom>-unknown-opcode-snapshot.json
 ```
 
-El comportamiento se controla en [src/index.ts](/c:/Users/mmordev/Desktop/Proyectos/minigb/src/index.ts):
-
-- `LOAD_FROM_SNAPSHOT = false`
-  Arranca desde el principio.
-
-- `LOAD_FROM_SNAPSHOT = true`
-  Intenta restaurar el snapshot asociado a la ROM actual.
-
 ## Sonido
 
 Hay una primera implementacion experimental de audio conectada a Web Audio:
 
 - lectura de registros principales del APU
 - sintesis aproximada de los cuatro canales
-- controles `Enable audio` y `Mute` en el panel
+- inicializacion automatica al abrir la ventana
+- control `Mute`
 
 No es un APU exacto, pero sirve para depurar si la ROM esta programando audio y para oir una aproximacion util del resultado.
-
-## Soporte de cartuchos y hardware
-
-Cartuchos soportados actualmente:
-
-- `ROM only`
-- `MBC1`
-- `MBC3`
-- `MBC5`
-
-Hardware soportado parcialmente:
-
-- modo `DMG`
-- modo `CGB`
-- compatibilidad de juegos DMG sobre hardware CGB con paletas de color
-
-## Limitaciones conocidas
-
-- La CPU todavia no tiene todos los opcodes implementados
-- El timing sigue siendo aproximado en varias areas
-- El PPU no es ciclo-exacto
-- `HDMA`, `STAT`, interrupciones y doble velocidad no estan afinados al 100%
-- El audio es funcional pero todavia aproximado
-- La compatibilidad entre ROMs sigue en construccion
-
-## Objetivo del proyecto
-
-El objetivo actual no es competir con emuladores maduros, sino construir y depurar un emulador de Game Boy paso a paso, entendiendo cada subsistema y dejando herramientas para iterar rapido.

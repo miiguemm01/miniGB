@@ -1,0 +1,762 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>miniGB</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #171310;
+            --panel: rgba(37, 29, 24, 0.82);
+            --panel-soft: rgba(84, 64, 49, 0.32);
+            --line: rgba(240, 217, 190, 0.14);
+            --text: #f4e7d8;
+            --muted: #cfb69d;
+            --good: #7ed79f;
+            --danger: #ff8e8e;
+            --shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(215, 127, 57, 0.18), transparent 28%),
+                radial-gradient(circle at top right, rgba(126, 215, 159, 0.10), transparent 22%),
+                linear-gradient(180deg, #2b1e16 0%, #171310 52%, #0e0c0b 100%);
+        }
+
+        .shell {
+            display: grid;
+            grid-template-columns: minmax(460px, 720px) minmax(360px, 1fr);
+            gap: 20px;
+            padding: 24px;
+        }
+
+        .stack {
+            display: grid;
+            gap: 20px;
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(16px);
+            overflow: hidden;
+        }
+
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            padding: 18px 20px 0;
+        }
+
+        .panel-body {
+            padding: 20px;
+        }
+
+        .eyebrow {
+            margin: 0;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            font-size: 0.72rem;
+        }
+
+        h1, h2 {
+            margin: 4px 0 0;
+            font-weight: 700;
+        }
+
+        h1 {
+            font-size: 1.8rem;
+        }
+
+        h2 {
+            font-size: 1rem;
+        }
+
+        .status-pill {
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: rgba(126, 215, 159, 0.12);
+            color: var(--good);
+            border: 1px solid rgba(126, 215, 159, 0.24);
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .status-pill.stopped {
+            background: rgba(255, 142, 142, 0.12);
+            color: var(--danger);
+            border-color: rgba(255, 142, 142, 0.24);
+        }
+
+        .frame-shell {
+            display: grid;
+            gap: 16px;
+        }
+
+        canvas {
+            width: 100%;
+            display: block;
+            background: #111;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+            border-radius: 18px;
+            border: 1px solid var(--line);
+        }
+
+        #screen {
+            aspect-ratio: 160 / 144;
+        }
+
+        #tiles {
+            aspect-ratio: 128 / 192;
+        }
+
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .speed-controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .metric {
+            padding: 14px;
+            border-radius: 18px;
+            background: var(--panel-soft);
+            border: 1px solid var(--line);
+        }
+
+        .metric-label {
+            display: block;
+            color: var(--muted);
+            font-size: 0.76rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .metric-value {
+            display: block;
+            margin-top: 6px;
+            font-size: 1.15rem;
+            font-weight: 700;
+        }
+
+        .button-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        button {
+            border: 1px solid rgba(240, 217, 190, 0.16);
+            background: linear-gradient(180deg, rgba(82, 60, 44, 0.95), rgba(58, 43, 32, 0.95));
+            color: var(--text);
+            border-radius: 14px;
+            padding: 11px 14px;
+            font: inherit;
+            cursor: pointer;
+        }
+
+        button.is-active {
+            background: linear-gradient(180deg, rgba(215, 127, 57, 0.95), rgba(170, 94, 36, 0.95));
+        }
+
+        .controls-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .code-block, .notes {
+            margin: 0;
+            white-space: pre-wrap;
+            font-family: Consolas, "SFMono-Regular", monospace;
+            font-size: 0.88rem;
+            line-height: 1.45;
+            color: #f8efe6;
+        }
+
+        .list-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .info-card {
+            padding: 14px;
+            border-radius: 18px;
+            background: var(--panel-soft);
+            border: 1px solid var(--line);
+        }
+
+        .info-title {
+            margin: 0 0 8px;
+            color: var(--muted);
+            font-size: 0.76rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .info-value {
+            margin: 0;
+            font-size: 0.95rem;
+            line-height: 1.4;
+            word-break: break-word;
+        }
+
+        .footer-status {
+            color: var(--muted);
+            font-size: 0.88rem;
+        }
+
+        @media (max-width: 1160px) {
+            .shell {
+                grid-template-columns: 1fr;
+            }
+
+            .list-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 760px) {
+            .shell {
+                padding: 16px;
+                gap: 16px;
+            }
+
+            .metrics,
+            .controls-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+    </style>
+</head>
+<body>
+    <main class="shell">
+        <section class="stack">
+            <article class="panel">
+                <div class="panel-header">
+                    <div>
+                        <p class="eyebrow">Desktop Debugger</p>
+                        <h1>miniGB</h1>
+                    </div>
+                    <div id="status-pill" class="status-pill">Running</div>
+                </div>
+                <div class="panel-body frame-shell">
+                    <canvas id="screen" width="160" height="144"></canvas>
+                    <div class="metrics">
+                        <div class="metric"><span class="metric-label">Frames</span><span class="metric-value" id="frames">0</span></div>
+                        <div class="metric"><span class="metric-label">Cycles</span><span class="metric-value" id="cycles">0</span></div>
+                        <div class="metric"><span class="metric-label">Instructions</span><span class="metric-value" id="instructions">0</span></div>
+                        <div class="metric"><span class="metric-label">View</span><span class="metric-value" id="screen-mode">lcd</span></div>
+                    </div>
+                    <div class="speed-controls">
+                        <button data-speed="1">1x velocidad</button>
+                        <button data-speed="2">2x velocidad</button>
+                        <button data-speed="4">4x velocidad</button>
+                        <button data-speed="8">8x velocidad</button>
+                    </div>
+                </div>
+            </article>
+
+            <article class="panel">
+                <div class="panel-header">
+                    <div>
+                        <p class="eyebrow">Input And Session</p>
+                        <h2>Controls</h2>
+                    </div>
+                </div>
+                <div class="panel-body stack">
+                    <div class="controls-grid">
+                        <button data-button="up">W / Up</button>
+                        <button data-button="left">A / Left</button>
+                        <button data-button="down">S / Down</button>
+                        <button data-button="right">D / Right</button>
+                        <button data-button="a">Z / A</button>
+                        <button data-button="b">X / B</button>
+                        <button data-button="select">Shift / Select</button>
+                        <button data-button="start">Enter / Start</button>
+                    </div>
+                    <div class="button-row">
+                        <button id="save-button">Save State</button>
+                        <button id="load-button">Load State</button>
+                        <button id="audio-mute-button">Mute</button>
+                    </div>
+                    <div class="footer-status" id="input-status">Input ready.</div>
+                    <div class="footer-status" id="save-status">Savestate ready.</div>
+                </div>
+            </article>
+        </section>
+
+        <section class="stack">
+            <article class="panel">
+                <div class="panel-header">
+                    <div>
+                        <p class="eyebrow">Machine State</p>
+                        <h2>Runtime Snapshot</h2>
+                    </div>
+                </div>
+                <div class="panel-body stack">
+                    <div class="list-grid">
+                        <div class="info-card"><p class="info-title">ROM</p><p class="info-value" id="rom-path">-</p></div>
+                        <div class="info-card"><p class="info-title">Cartridge</p><p class="info-value" id="cart-type">-</p></div>
+                        <div class="info-card"><p class="info-title">Mapper</p><p class="info-value" id="cart-mapper">-</p></div>
+                        <div class="info-card"><p class="info-title">SaveState</p><p class="info-value" id="save-state-updated">No save yet.</p></div>
+                    </div>
+                    <div class="list-grid">
+                        <div class="info-card"><p class="info-title">Registers</p><pre class="code-block" id="registers"></pre></div>
+                        <div class="info-card"><p class="info-title">LCD</p><pre class="code-block" id="lcd-registers"></pre></div>
+                    </div>
+                    <div class="info-card"><p class="info-title">Video Notes</p><pre class="notes" id="video-notes"></pre></div>
+                    <div class="info-card"><p class="info-title">Audio Channels</p><p class="info-value" id="audio-channels">No audio data yet.</p></div>
+                </div>
+            </article>
+
+            <article class="panel">
+                <div class="panel-header">
+                    <div>
+                        <p class="eyebrow">VRAM And Faults</p>
+                        <h2>Tiles And Trace</h2>
+                    </div>
+                </div>
+                <div class="panel-body stack">
+                    <canvas id="tiles" width="128" height="192"></canvas>
+                    <div class="info-card"><p class="info-title">Trace / Errors</p><pre class="notes" id="error">No errors.</pre></div>
+                </div>
+            </article>
+        </section>
+    </main>
+
+    <script>
+        const screenCanvas = document.getElementById("screen");
+        const screenContext = screenCanvas.getContext("2d");
+        const tilesCanvas = document.getElementById("tiles");
+        const tilesContext = tilesCanvas.getContext("2d");
+        const statusPill = document.getElementById("status-pill");
+        const controlButtons = Array.from(document.querySelectorAll("[data-button]"));
+        const speedButtons = Array.from(document.querySelectorAll("[data-speed]"));
+        const saveStateButton = document.getElementById("save-button");
+        const loadStateButton = document.getElementById("load-button");
+        const audioEnableButton = document.getElementById("audio-enable-button");
+        const audioMuteButton = document.getElementById("audio-mute-button");
+        const pressedKeys = new Set();
+
+        const keyToButton = { d: "right", a: "left", w: "up", s: "down", z: "a", x: "b", Shift: "select", Enter: "start" };
+
+        function setText(id, value) {
+            const element = document.getElementById(id);
+            if (element) {
+                element.textContent = value;
+            }
+        }
+
+        function decodeBase64Frame(base64) {
+            const binary = atob(base64);
+            const buffer = new Uint8ClampedArray(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+                buffer[index] = binary.charCodeAt(index);
+            }
+            return buffer;
+        }
+
+        function drawFrame(context, width, height, frame) {
+            context.putImageData(new ImageData(frame, width, height), 0, 0);
+        }
+
+        function normalizeKey(event) {
+            return event.key.length === 1 ? event.key.toLowerCase() : event.key;
+        }
+
+        function setButtonPressed(button, pressed) {
+            for (const element of controlButtons) {
+                if (element.dataset.button === button) {
+                    element.classList.toggle("is-active", pressed);
+                }
+            }
+        }
+
+        function setSpeedPressed(multiplier) {
+            for (const element of speedButtons) {
+                element.classList.toggle("is-active", Number(element.dataset.speed) === multiplier);
+            }
+        }
+
+        async function sendInput(button, pressed, source) {
+            setButtonPressed(button, pressed);
+            setText("input-status", (pressed ? "Pressed " : "Released ") + button + " via " + source + ".");
+            try {
+                await window.miniGb.setJoypadButton(button, pressed);
+            } catch (error) {
+                setText("input-status", "Input error: " + String(error));
+            }
+        }
+
+        async function sendSaveStateAction(action, source) {
+            const label = action === "save" ? "save" : "load";
+            setText("save-status", "Attempting to " + label + " via " + source + "...");
+            try {
+                const payload = await window.miniGb.saveState(action);
+                setText("save-status", payload.message);
+                setText("save-state-updated", payload.saveState.exists && payload.saveState.updatedAt ? payload.saveState.updatedAt : "No save yet.");
+            } catch (error) {
+                setText("save-status", "Savestate error: " + String(error));
+            }
+        }
+
+        async function setSpeedMultiplier(multiplier, source) {
+            setText("input-status", "Setting speed to " + multiplier + "x via " + source + "...");
+            try {
+                const emulatorState = await window.miniGb.setSpeedMultiplier(multiplier);
+                applyEmulatorState(emulatorState);
+                setText("input-status", "Speed set to " + multiplier + "x via " + source + ".");
+            } catch (error) {
+                setText("input-status", "Speed error: " + String(error));
+            }
+        }
+
+        function createDutyWave(context, dutyIndex) {
+            const dutyPatterns = [
+                [1, 0, 0, 0, 0, 0, 0, 0],
+                [1, 1, 0, 0, 0, 0, 0, 0],
+                [1, 1, 1, 1, 0, 0, 0, 0],
+                [0, 0, 1, 1, 1, 1, 1, 1],
+            ];
+            const pattern = dutyPatterns[dutyIndex] || dutyPatterns[2];
+            const harmonics = 32;
+            const real = new Float32Array(harmonics + 1);
+            const imaginary = new Float32Array(harmonics + 1);
+
+            for (let harmonic = 1; harmonic <= harmonics; harmonic += 1) {
+                let realSum = 0;
+                let imaginarySum = 0;
+                for (let sample = 0; sample < pattern.length; sample += 1) {
+                    const phase = (2 * Math.PI * harmonic * sample) / pattern.length;
+                    const amplitude = pattern[sample];
+                    realSum += amplitude * Math.cos(phase);
+                    imaginarySum += amplitude * Math.sin(phase);
+                }
+                real[harmonic] = realSum / pattern.length;
+                imaginary[harmonic] = -imaginarySum / pattern.length;
+            }
+
+            return context.createPeriodicWave(real, imaginary, { disableNormalization: false });
+        }
+
+        function createNoiseBuffer(context) {
+            const size = context.sampleRate * 2;
+            const buffer = context.createBuffer(1, size, context.sampleRate);
+            const channel = buffer.getChannelData(0);
+            for (let index = 0; index < size; index += 1) {
+                channel[index] = (Math.random() * 2) - 1;
+            }
+            return buffer;
+        }
+
+        function createWavePeriodicWave(context, waveSamples) {
+            const sampleCount = Math.max(32, waveSamples.length || 32);
+            const harmonics = sampleCount;
+            const real = new Float32Array(harmonics + 1);
+            const imaginary = new Float32Array(harmonics + 1);
+
+            for (let harmonic = 1; harmonic <= harmonics; harmonic += 1) {
+                let realSum = 0;
+                let imaginarySum = 0;
+                for (let sample = 0; sample < sampleCount; sample += 1) {
+                    const amplitude = ((waveSamples[sample] ?? 0.5) * 2) - 1;
+                    const phase = (2 * Math.PI * harmonic * sample) / sampleCount;
+                    realSum += amplitude * Math.cos(phase);
+                    imaginarySum += amplitude * Math.sin(phase);
+                }
+                real[harmonic] = realSum / sampleCount;
+                imaginary[harmonic] = -imaginarySum / sampleCount;
+            }
+
+            return context.createPeriodicWave(real, imaginary, { disableNormalization: false });
+        }
+
+        const audioEngine = {
+            context: null,
+            masterGain: null,
+            userGain: 0.18,
+            muted: false,
+            initialized: false,
+            noiseBuffer: null,
+            squareDutyWaves: [],
+            channels: [],
+        };
+
+        function updateAudioOutputLevel() {
+            if (audioEngine.masterGain) {
+                audioEngine.masterGain.gain.value = audioEngine.muted ? 0 : audioEngine.userGain;
+            }
+        }
+
+        function createOscillatorChannel(kind) {
+            const context = audioEngine.context;
+            const oscillator = context.createOscillator();
+            const gain = context.createGain();
+            const panner = context.createStereoPanner();
+            gain.gain.value = 0;
+            oscillator.type = kind === "wave" ? "sine" : "square";
+            oscillator.connect(gain);
+            gain.connect(panner);
+            panner.connect(audioEngine.masterGain);
+            oscillator.start();
+            return { kind, oscillator, gain, panner, lastDuty: 2 };
+        }
+
+        function createNoiseChannel() {
+            const context = audioEngine.context;
+            const source = context.createBufferSource();
+            const gain = context.createGain();
+            const panner = context.createStereoPanner();
+            const filter = context.createBiquadFilter();
+            source.buffer = audioEngine.noiseBuffer;
+            source.loop = true;
+            filter.type = "highpass";
+            filter.frequency.value = 1000;
+            gain.gain.value = 0;
+            source.connect(filter);
+            filter.connect(gain);
+            gain.connect(panner);
+            panner.connect(audioEngine.masterGain);
+            source.start();
+            return { kind: "noise", source, gain, panner, filter };
+        }
+
+        async function ensureAudioEngine() {
+            if (audioEngine.initialized) {
+                if (audioEngine.context.state === "suspended") {
+                    await audioEngine.context.resume();
+                }
+                setText("audio-status", "Audio enabled.");
+                return;
+            }
+
+            const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextClass) {
+                setText("audio-status", "Web Audio is not available in this environment.");
+                return;
+            }
+
+            const context = new AudioContextClass();
+            const masterGain = context.createGain();
+            masterGain.connect(context.destination);
+            audioEngine.context = context;
+            audioEngine.masterGain = masterGain;
+            audioEngine.noiseBuffer = createNoiseBuffer(context);
+            audioEngine.squareDutyWaves = [0, 1, 2, 3].map((index) => createDutyWave(context, index));
+            audioEngine.channels = [
+                createOscillatorChannel("square"),
+                createOscillatorChannel("square"),
+                createOscillatorChannel("wave"),
+                createNoiseChannel(),
+            ];
+            audioEngine.initialized = true;
+            updateAudioOutputLevel();
+            await context.resume();
+            setText("audio-status", "Audio enabled.");
+        }
+
+        function applyChannelPan(channelNode, channelState) {
+            if (channelState.panLeft && channelState.panRight) {
+                channelNode.panner.pan.value = 0;
+            } else if (channelState.panLeft) {
+                channelNode.panner.pan.value = -1;
+            } else if (channelState.panRight) {
+                channelNode.panner.pan.value = 1;
+            } else {
+                channelNode.panner.pan.value = 0;
+            }
+        }
+
+        function applyAudioState(audioState) {
+            setText("audio-channels", audioState.channels.map((channel) => "CH" + channel.id + ":" + (channel.enabled ? "on" : "off") + " " + channel.kind + " " + channel.frequency.toFixed(1) + "Hz").join(" | "));
+
+            if (!audioEngine.initialized) {
+                setText("audio-status", audioState.masterEnabled ? "Audio registers active. Click Enable Audio to listen." : "Audio master disabled in the emulated hardware.");
+                return;
+            }
+
+            const stereoMaster = Math.max(audioState.leftVolume, audioState.rightVolume);
+            audioEngine.masterGain.gain.value = audioEngine.muted ? 0 : audioEngine.userGain * stereoMaster;
+
+            for (let index = 0; index < audioState.channels.length; index += 1) {
+                const channelState = audioState.channels[index];
+                const node = audioEngine.channels[index];
+                const audible = channelState.enabled && (channelState.panLeft || channelState.panRight) && channelState.volume > 0;
+
+                if (node.kind === "noise") {
+                    node.gain.gain.value = audible ? channelState.volume * 0.18 : 0;
+                    node.source.playbackRate.value = Math.max(0.05, Math.min(4, channelState.frequency / 2048));
+                    node.filter.frequency.value = Math.max(80, Math.min(12000, channelState.frequency * 3));
+                    applyChannelPan(node, channelState);
+                    continue;
+                }
+
+                if (channelState.kind === "wave") {
+                    node.oscillator.setPeriodicWave(createWavePeriodicWave(audioEngine.context, channelState.waveSamples));
+                } else if (node.lastDuty !== channelState.duty) {
+                    node.oscillator.setPeriodicWave(audioEngine.squareDutyWaves[channelState.duty] || audioEngine.squareDutyWaves[2]);
+                    node.lastDuty = channelState.duty;
+                }
+
+                node.oscillator.frequency.value = Math.max(0.001, channelState.frequency);
+                node.gain.gain.value = audible ? channelState.volume * 0.16 : 0;
+                applyChannelPan(node, channelState);
+            }
+
+            setText("audio-status", audioState.masterEnabled ? "Audio streaming from Web Audio." : "Audio master disabled in the emulated hardware.");
+        }
+
+        function applyEmulatorState(emulatorState) {
+            setText("rom-path", emulatorState.romPath);
+            setText("cart-mapper", emulatorState.cartridge.mapper + " | " + emulatorState.cartridge.title);
+            setText("cart-type", emulatorState.cartridge.typeName + " " + emulatorState.cartridge.typeCode + " | ROM " + emulatorState.cartridge.romBanks + " | RAM " + emulatorState.cartridge.ramBanks + (emulatorState.cartridge.features.length > 0 ? " | " + emulatorState.cartridge.features.join(", ") : ""));
+            setText("frames", String(emulatorState.frames));
+            setText("cycles", String(emulatorState.cycles));
+            setText("instructions", String(emulatorState.instructions));
+            setText("screen-mode", emulatorState.screenMode);
+            setSpeedPressed(emulatorState.speedMultiplier);
+            setText("save-state-updated", emulatorState.saveState.exists && emulatorState.saveState.updatedAt ? emulatorState.saveState.updatedAt : "No save yet.");
+            setText("registers", ["AF: " + emulatorState.registers.af, "BC: " + emulatorState.registers.bc, "DE: " + emulatorState.registers.de, "HL: " + emulatorState.registers.hl, "A:  " + emulatorState.registers.a, "B:  " + emulatorState.registers.b, "C:  " + emulatorState.registers.c, "D:  " + emulatorState.registers.d, "E:  " + emulatorState.registers.e, "H:  " + emulatorState.registers.h, "L:  " + emulatorState.registers.l, "F:  " + emulatorState.registers.f].join("\n"));
+            setText("lcd-registers", ["JOYP: " + emulatorState.lcd.joyp, "LCDC: " + emulatorState.lcd.lcdc, "LY:   " + emulatorState.lcd.ly, "SCX:  " + emulatorState.lcd.scx, "SCY:  " + emulatorState.lcd.scy, "BGP:  " + emulatorState.lcd.bgp].join("\n"));
+            setText("video-notes", emulatorState.video.notes.join("\n"));
+            setText("error", emulatorState.error ? emulatorState.error + "\n\nRecent trace:\n" + emulatorState.trace.join("\n") : "No errors.");
+            applyAudioState(emulatorState.audio);
+            statusPill.textContent = emulatorState.running ? "Running" : "Stopped";
+            statusPill.classList.toggle("stopped", !emulatorState.running);
+        }
+
+        function applyFramePayload(payload) {
+            drawFrame(screenContext, 160, 144, decodeBase64Frame(payload.screen));
+            if (payload.tiles) {
+                drawFrame(tilesContext, 128, 192, decodeBase64Frame(payload.tiles));
+            }
+            applyEmulatorState(payload.state);
+        }
+
+        function handleKeyDown(event) {
+            const key = normalizeKey(event);
+            const button = keyToButton[key];
+            if (key === "k") {
+                if (!event.repeat) {
+                    event.preventDefault();
+                    sendSaveStateAction("save", "keyboard");
+                }
+                return;
+            }
+            if (key === "l") {
+                if (!event.repeat) {
+                    event.preventDefault();
+                    sendSaveStateAction("load", "keyboard");
+                }
+                return;
+            }
+            if (!button || pressedKeys.has(key)) {
+                return;
+            }
+            pressedKeys.add(key);
+            event.preventDefault();
+            sendInput(button, true, "keyboard");
+        }
+
+        function handleKeyUp(event) {
+            const key = normalizeKey(event);
+            const button = keyToButton[key];
+            if (!button) {
+                return;
+            }
+            pressedKeys.delete(key);
+            event.preventDefault();
+            sendInput(button, false, "keyboard");
+        }
+
+        document.addEventListener("keydown", handleKeyDown, true);
+        document.addEventListener("keyup", handleKeyUp, true);
+
+        window.addEventListener("blur", () => {
+            for (const key of pressedKeys) {
+                const button = keyToButton[key];
+                if (button) {
+                    sendInput(button, false, "blur");
+                }
+            }
+            pressedKeys.clear();
+        });
+
+        for (const element of controlButtons) {
+            const button = element.dataset.button;
+            if (!button) {
+                continue;
+            }
+
+            element.addEventListener("pointerdown", (event) => {
+                event.preventDefault();
+                if (element.setPointerCapture) {
+                    element.setPointerCapture(event.pointerId);
+                }
+                sendInput(button, true, "pointer");
+            });
+            element.addEventListener("pointerup", (event) => {
+                event.preventDefault();
+                sendInput(button, false, "pointer");
+            });
+            element.addEventListener("pointercancel", () => sendInput(button, false, "pointer"));
+            element.addEventListener("lostpointercapture", () => sendInput(button, false, "pointer"));
+        }
+
+        for (const element of speedButtons) {
+            const multiplier = Number(element.dataset.speed);
+            if (!Number.isFinite(multiplier)) {
+                continue;
+            }
+
+            element.addEventListener("click", () => {
+                setSpeedMultiplier(multiplier, "button");
+            });
+        }
+
+        saveStateButton.addEventListener("click", () => sendSaveStateAction("save", "button"));
+        loadStateButton.addEventListener("click", () => sendSaveStateAction("load", "button"));
+        audioMuteButton.addEventListener("click", () => {
+            audioEngine.muted = !audioEngine.muted;
+            updateAudioOutputLevel();
+            audioMuteButton.textContent = audioEngine.muted ? "Unmute" : "Mute";
+            setText("audio-status", audioEngine.muted ? "Audio muted." : "Audio unmuted.");
+        });
+
+        window.addEventListener("load", async () => {
+            window.focus();
+            try {
+                applyFramePayload(await window.miniGb.getInitialFrame());
+                window.miniGb.onFrame((payload) => applyFramePayload(payload));
+                await ensureAudioEngine();
+            } catch (error) {
+                setText("error", "Failed to initialize renderer: " + String(error));
+            }
+        });
+    </script>
+</body>
+</html>

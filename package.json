@@ -2,18 +2,19 @@
   "name": "minigb",
   "version": "0.0.1",
   "description": "Homemade Nintendo´s Game Boy emulator made in Typescript",
-  "main": "src/index.ts",
+  "main": "dist/electron/main.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node -r ts-node/register src/index.ts"
+    "build": "tsc",
+    "start": "npm run build && set ELECTRON_RUN_AS_NODE=&& electron .",
+    "typecheck": "tsc --noEmit"
   },
   "author": "mmordev01",
   "license": "ISC",
-  "dependencies": {
-    "fs": "^0.0.1-security",
-    "ts-node": "^10.9.2"
-  },
+  "dependencies": {},
   "devDependencies": {
-    "@types/node": "^25.9.1"
+    "@types/node": "^25.9.1",
+    "electron": "^30.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
   }
 }
